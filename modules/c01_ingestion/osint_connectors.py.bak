@@ -1,0 +1,1401 @@
+"""
+prahar/modules/c01_ingestion/osint_connectors.py
+Full OSINT connector suite — 25+ sources for person, username, domain, email, phone, face.
+All connectors are async and return a dict ready for audit.store_record().
+"""
+import asyncio
+import base64
+import os
+import re
+import json
+from datetime import datetime
+from loguru import logger
+import aiohttp
+from typing import Optional, List
+
+# ── API keys from env ─────────────────────────────────────────
+GITHUB_TOKEN       = os.getenv("GITHUB_TOKEN", "")
+SHODAN_API_KEY     = os.getenv("SHODAN_API_KEY", "")
+VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
+ABUSEIPDB_API_KEY  = os.getenv("ABUSEIPDB_API_KEY", "")
+GOOGLE_CSE_KEY     = os.getenv("GOOGLE_CSE_KEY", "")
+GOOGLE_CSE_ID      = os.getenv("GOOGLE_CSE_ID", "")
+HIBP_API_KEY       = os.getenv("HIBP_API_KEY", "")
+HUNTER_API_KEY     = os.getenv("HUNTER_IO_API_KEY", "")
+GNEWS_API_KEY      = os.getenv("GNEWS_API_KEY", "")       # free: gnews.io/register
+CURRENTS_API_KEY   = os.getenv("CURRENTS_API_KEY", "")    # free: currentsapi.services
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
+TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+HEADERS_BROWSER = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+
+
+async def _get(session, url, headers=None, params=None, label="") -> Optional[dict]:
+    try:
+        h = {**HEADERS_BROWSER, **(headers or {})}
+        async with session.get(url, headers=h, params=params, timeout=TIMEOUT, ssl=False) as r:
+            if r.status == 200:
+                ct = r.headers.get("Content-Type", "")
+                if "json" in ct:
+                    return await r.json(content_type=None)
+                return {"raw_text": await r.text()}
+            logger.debug(f"[{label}] HTTP {r.status}")
+    except Exception as e:
+        if "Cannot connect" in str(e) or "timeout" in str(e).lower():
+            logger.warning(f"[{label}] CONNECTION FAILED: {type(e).__name__}: {str(e)[:100]}")
+        else:
+            logger.warning(f"[{label}] {e}")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  PERSON / NAME SOURCES
+# ══════════════════════════════════════════════════════════════
+
+async def fetch_wikipedia(name: str, session: aiohttp.ClientSession) -> dict:
+    """Wikipedia summary for a person by name."""
+    clean = name.strip().title()
+    url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + name.replace(" ", "_")
+    data = await _get(session, url, label="Wikipedia")
+    if data and data.get("type") != "https://mediawiki.org/wiki/HyperSwitch/errors/not_found":
+        logger.info(f"[Wikipedia] Found article for: {name}")
+        return {
+            "source": "wikipedia", "name": name,
+            "title":   data.get("title"),
+            "extract": data.get("extract"),
+            "thumbnail": data.get("thumbnail", {}).get("source"),
+            "url":     data.get("content_urls", {}).get("desktop", {}).get("page"),
+            "description": data.get("description"),
+        }
+    return {}
+
+
+async def fetch_wikidata(name: str, session: aiohttp.ClientSession) -> dict:
+    """Wikidata structured entity data."""
+    url = "https://www.wikidata.org/w/api.php"
+    params = {"action": "wbsearchentities", "search": name, "language": "en",
+              "format": "json", "type": "item", "limit": 3}
+    data = await _get(session, url, params=params, label="Wikidata")
+    if data and data.get("search"):
+        results = data["search"]
+        logger.info(f"[Wikidata] {len(results)} entities for: {name}")
+        return {"source": "wikidata", "name": name, "entities": results}
+    return {}
+
+
+async def fetch_duckduckgo(query: str, session: aiohttp.ClientSession) -> dict:
+    """DuckDuckGo instant answers API."""
+    url = "https://api.duckduckgo.com/"
+    params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+    data = await _get(session, url, params=params, label="DuckDuckGo")
+    if data and (data.get("AbstractText") or data.get("Answer") or data.get("RelatedTopics")):
+        logger.info(f"[DuckDuckGo] Got results for: {query}")
+        return {
+            "source": "duckduckgo", "query": query,
+            "abstract": data.get("AbstractText"),
+            "answer":   data.get("Answer"),
+            "image":    data.get("Image"),
+            "source_url": data.get("AbstractURL"),
+            "related": [t.get("Text") for t in data.get("RelatedTopics", [])[:5] if isinstance(t, dict)],
+        }
+    return {}
+
+
+async def fetch_google_cse(query: str, session: aiohttp.ClientSession) -> dict:
+    """Google Custom Search — returns top 10 results."""
+    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_ID:
+        logger.debug("[Google CSE] No API key configured")
+        return {}
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_ID, "q": query, "num": 10}
+    data = await _get(session, url, params=params, label="Google CSE")
+    if data and data.get("items"):
+        items = data["items"]
+        logger.info(f"[Google CSE] {len(items)} results for: {query}")
+        return {
+            "source": "google_cse", "query": query,
+            "results": [{"title": i.get("title"), "url": i.get("link"),
+                         "snippet": i.get("snippet")} for i in items],
+        }
+    return {}
+
+
+async def fetch_pipl_free(name: str, session: aiohttp.ClientSession) -> dict:
+    """Pipl-style people search via free public sources."""
+    results = {}
+    # Spokeo public search
+    try:
+        url = f"https://www.spokeo.com/{name.replace(' ', '-')}"
+        async with session.get(url, headers=HEADERS_BROWSER, timeout=TIMEOUT) as r:
+            if r.status == 200:
+                text = await r.text()
+                results["spokeo_found"] = "spokeo.com" in r.url.human_repr()
+    except Exception:
+        pass
+    if results:
+        return {"source": "people_search", "name": name, **results}
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════
+#  USERNAME / SOCIAL MEDIA SOURCES
+# ══════════════════════════════════════════════════════════════
+
+# 30 platforms to check username existence
+USERNAME_PLATFORMS = {
+    "github":     "https://api.github.com/users/{u}",
+    "reddit":     None,
+    "twitter":    None,
+    "instagram":  None,  # blocks bots
+    "tiktok":     None,  # blocks bots
+    "youtube":    None,  # returns 200 for any username
+    "twitch":     None,  # returns 200 for any username
+    "linkedin":   None,  # requires auth
+    "medium":     "https://medium.com/@{u}",
+    "dev_to":     "https://dev.to/{u}",
+    "stackoverflow": "https://stackoverflow.com/users/{u}",
+    "hackernews": "https://hacker-news.firebaseio.com/v0/user/{u}.json",
+    "gitlab":     "https://gitlab.com/api/v4/users?username={u}",
+    "keybase":    "https://keybase.io/{u}/_/api/1.0/user/lookup.json?username={u}",
+    "pinterest":  None,
+    "telegram":   None,  # returns 200 for any username
+    "discord":    None,  # no public API
+    "patreon":    "https://www.patreon.com/{u}",
+    "producthunt":"https://www.producthunt.com/@{u}",
+    "angellist":  "https://angel.co/{u}",
+    "behance":    None,  # returns 200 for any username
+    "dribbble":   "https://dribbble.com/{u}",
+    "npm":        "https://registry.npmjs.org/-/user/org.couchdb.user:{u}",
+    "pypi":       None,
+    "dockerhub":  None,
+    "mastodon":   None,  # returns 200 for any username
+    "gravatar":   "https://en.gravatar.com/{u}.json",
+    "about_me":   None,  # returns 200 for any username
+    "trello":     None,
+    "steam":      None,
+}
+
+
+async def check_username_platform(username: str, platform: str, url_tpl: str,
+                                   session: aiohttp.ClientSession) -> dict:
+    """Check if username exists on a platform. Returns profile data if found."""
+    if not url_tpl:
+        return {}
+    url = url_tpl.format(u=username)
+    try:
+        async with session.get(url, headers=HEADERS_BROWSER, timeout=TIMEOUT,
+                               allow_redirects=True) as r:
+            if r.status in (200, 301, 302):
+                ct = r.headers.get("Content-Type", "")
+                data = {}
+                if "json" in ct:
+                    try:
+                        data = await r.json(content_type=None)
+                    except Exception:
+                        pass
+                return {"platform": platform, "url": str(r.url),
+                        "found": True, "data": data}
+    except Exception:
+        pass
+    return {}
+
+
+async def fetch_username_sweep(username: str, session: aiohttp.ClientSession) -> dict:
+    """Check username across all platforms concurrently."""
+    tasks = {
+        p: check_username_platform(username, p, url, session)
+        for p, url in USERNAME_PLATFORMS.items() if url
+    }
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    found = []
+    for platform, result in zip(tasks.keys(), results):
+        if isinstance(result, dict) and result.get("found"):
+            found.append(result)
+            logger.info(f"[UserSweep] {username} found on {platform}")
+
+    if found:
+        return {
+            "source": "username_sweep", "username": username,
+            "platforms_found": len(found),
+            "profiles": found,
+        }
+    return {}
+
+
+async def fetch_github_user(username: str, session: aiohttp.ClientSession) -> dict:
+    """GitHub full profile + repos + gists + orgs."""
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    try:
+        async with session.get(f"https://api.github.com/users/{username}",
+                               headers=headers, timeout=TIMEOUT) as r:
+            if r.status != 200:
+                return {}
+            profile = await r.json()
+
+        repos, gists, orgs, events = await asyncio.gather(
+            _get(session, f"https://api.github.com/users/{username}/repos?per_page=30&sort=updated", headers=headers, label="GH repos"),
+            _get(session, f"https://api.github.com/users/{username}/gists?per_page=10", headers=headers, label="GH gists"),
+            _get(session, f"https://api.github.com/users/{username}/orgs", headers=headers, label="GH orgs"),
+            _get(session, f"https://api.github.com/users/{username}/events/public?per_page=30", headers=headers, label="GH events"),
+        )
+        logger.info(f"[GitHub] {username} → {len(repos or [])} repos, {len(orgs or [])} orgs")
+        return {
+            "source": "github", "username": username,
+            "profile": profile,
+            "repos":   repos or [],
+            "gists":   gists or [],
+            "orgs":    orgs or [],
+            "recent_events": events or [],
+        }
+    except Exception as e:
+        logger.warning(f"[GitHub] {username}: {e}")
+    return {}
+
+
+async def fetch_reddit_user(username: str, session: aiohttp.ClientSession) -> dict:
+    """Reddit public profile + recent posts."""
+    try:
+        h = {"User-Agent": "PRAHAR-OSINT/2.0"}
+        about, posts = await asyncio.gather(
+            _get(session, f"https://www.reddit.com/user/{username}/about.json", headers=h, label="Reddit"),
+            _get(session, f"https://www.reddit.com/user/{username}/submitted.json?limit=25", headers=h, label="Reddit posts"),
+        )
+        if about and about.get("data"):
+            d = about["data"]
+            logger.info(f"[Reddit] {username} → {d.get('link_karma',0)} karma")
+            return {
+                "source": "reddit", "username": username,
+                "name":         d.get("name"),
+                "created_utc":  d.get("created_utc"),
+                "link_karma":   d.get("link_karma"),
+                "comment_karma":d.get("comment_karma"),
+                "is_gold":      d.get("is_gold"),
+                "icon_img":     d.get("icon_img"),
+                "posts": [
+                    {"title": p["data"].get("title"), "subreddit": p["data"].get("subreddit"),
+                     "score": p["data"].get("score"), "url": p["data"].get("url")}
+                    for p in (posts or {}).get("data", {}).get("children", [])[:10]
+                    if p.get("data")
+                ],
+            }
+    except Exception as e:
+        logger.warning(f"[Reddit] {username}: {e}")
+    return {}
+
+
+async def fetch_hackernews_user(username: str, session: aiohttp.ClientSession) -> dict:
+    """HackerNews public user data."""
+    data = await _get(session, f"https://hacker-news.firebaseio.com/v0/user/{username}.json", label="HN")
+    if data and data.get("id"):
+        logger.info(f"[HackerNews] Found user: {username}")
+        return {
+            "source": "hackernews", "username": username,
+            "karma": data.get("karma"), "about": data.get("about"),
+            "created": data.get("created"),
+            "submitted_count": len(data.get("submitted", [])),
+        }
+    return {}
+
+
+async def fetch_keybase(username: str, session: aiohttp.ClientSession) -> dict:
+    """Keybase identity proofs."""
+    data = await _get(session, f"https://keybase.io/_/api/1.0/user/lookup.json?username={username}", label="Keybase")
+    if data and data.get("them"):
+        them = data["them"][0] if isinstance(data["them"], list) else data["them"]
+        proofs = them.get("proofs_summary", {}).get("all", [])
+        logger.info(f"[Keybase] {username} → {len(proofs)} proofs")
+        return {
+            "source": "keybase", "username": username,
+            "full_name": them.get("profile", {}).get("full_name"),
+            "location":  them.get("profile", {}).get("location"),
+            "bio":       them.get("profile", {}).get("bio"),
+            "proofs":    [{"proof_type": p.get("proof_type"), "nametag": p.get("nametag"),
+                           "state": p.get("state")} for p in proofs],
+        }
+    return {}
+
+
+async def fetch_gitlab_user(username: str, session: aiohttp.ClientSession) -> dict:
+    """GitLab public user profile."""
+    data = await _get(session, f"https://gitlab.com/api/v4/users?username={username}", label="GitLab")
+    if data and isinstance(data, list) and data:
+        u = data[0]
+        logger.info(f"[GitLab] Found: {username}")
+        return {
+            "source": "gitlab", "username": username,
+            "name":       u.get("name"),
+            "bio":        u.get("bio"),
+            "location":   u.get("location"),
+            "website":    u.get("website_url"),
+            "avatar":     u.get("avatar_url"),
+            "created_at": u.get("created_at"),
+        }
+    return {}
+
+
+async def fetch_npm_user(username: str, session: aiohttp.ClientSession) -> dict:
+    """npm registry user profile."""
+    data = await _get(session, f"https://registry.npmjs.org/-/user/org.couchdb.user:{username}", label="npm")
+    if data and data.get("name"):
+        return {
+            "source": "npm", "username": username,
+            "email": data.get("email"), "twitter": data.get("twitter"),
+            "github": data.get("github"), "fullname": data.get("fullname"),
+        }
+    return {}
+
+
+async def fetch_pypi_user(username: str, session: aiohttp.ClientSession) -> dict:
+    """PyPI packages by author."""
+    data = await _get(session, f"https://pypi.org/simple/", label="PyPI-check")
+    # Search PyPI JSON API for packages by this author
+    search_url = f"https://pypi.org/pypi/{username}/json"
+    pkg = await _get(session, search_url, label="PyPI")
+    if pkg and pkg.get("info"):
+        i = pkg["info"]
+        return {
+            "source": "pypi", "username": username,
+            "package": i.get("name"), "author": i.get("author"),
+            "email": i.get("author_email"), "summary": i.get("summary"),
+            "home_page": i.get("home_page"),
+        }
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════
+#  EMAIL SOURCES
+# ══════════════════════════════════════════════════════════════
+
+async def fetch_hibp(email: str, session: aiohttp.ClientSession) -> dict:
+    """HIBP disabled — paid API. Use free alternatives."""
+    return {}  # disabled - requires paid subscription
+    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
+    headers = {"hibp-api-key": HIBP_API_KEY, "user-agent": "PRAHAR-OSINT"}
+    data = await _get(session, url, headers=headers, label="HIBP")
+    if data and isinstance(data, list):
+        logger.info(f"[HIBP] {email} → {len(data)} breaches")
+        return {
+            "source": "hibp", "email": email,
+            "breach_count": len(data),
+            "breaches": [{"name": b.get("Name"), "date": b.get("BreachDate"),
+                          "data_classes": b.get("DataClasses", [])} for b in data],
+        }
+    return {}
+
+
+async def fetch_breach_free(email: str, session: aiohttp.ClientSession) -> dict:
+    """
+    Free breach check via C2 free API — no key needed.
+    Uses emailrep.io (free tier: 1000/day) for reputation.
+    """
+    try:
+        url = f"https://emailrep.io/{email}"
+        headers = {"User-Agent": "PRAHAR-OSINT/2.0"}
+        async with session.get(url, headers=headers, timeout=TIMEOUT, ssl=False) as r:
+            if r.status == 200:
+                data = await r.json(content_type=None)
+                if data:
+                    logger.info(f"[EmailRep] Got reputation for {email}")
+                    return {
+                        "source": "emailrep",
+                        "email": email,
+                        "reputation": data.get("reputation"),
+                        "suspicious": data.get("suspicious"),
+                        "references": data.get("references"),
+                        "details": data.get("details", {}),
+                        "breach_count": data.get("details", {}).get("data_breach", False),
+                        "profiles": list(data.get("details", {}).get("profiles", [])),
+                        "first_seen": data.get("details", {}).get("first_seen"),
+                        "last_seen": data.get("details", {}).get("last_seen"),
+                    }
+    except Exception as e:
+        logger.warning(f"[EmailRep] {e}")
+    return {}
+
+
+async def fetch_gravatar(email: str, session: aiohttp.ClientSession) -> dict:
+    """Gravatar profile from email hash."""
+    import hashlib
+    email_hash = hashlib.md5(email.lower().strip().encode()).hexdigest()
+    data = await _get(session, f"https://en.gravatar.com/{email_hash}.json", label="Gravatar")
+    if data and data.get("entry"):
+        e = data["entry"][0]
+        logger.info(f"[Gravatar] Profile found for email hash")
+        return {
+            "source": "gravatar", "email": email,
+            "displayName":  e.get("displayName"),
+            "preferredUsername": e.get("preferredUsername"),
+            "thumbnailUrl": e.get("thumbnailUrl"),
+            "aboutMe":      e.get("aboutMe"),
+            "profileUrl":   e.get("profileUrl"),
+            "accounts":     e.get("accounts", []),
+            "urls":         e.get("urls", []),
+        }
+    return {}
+
+
+async def fetch_hunter_email(domain: str, name: str, session: aiohttp.ClientSession) -> dict:
+    """Hunter.io disabled — use free alternatives."""
+    return {}  # disabled - very limited free tier
+    parts = name.strip().split()
+    params = {"domain": domain, "first_name": parts[0] if parts else name,
+              "last_name": parts[-1] if len(parts) > 1 else "",
+              "api_key": HUNTER_API_KEY}
+    data = await _get(session, "https://api.hunter.io/v2/email-finder", params=params, label="Hunter.io")
+    if data and data.get("data", {}).get("email"):
+        d = data["data"]
+        logger.info(f"[Hunter.io] Found email for {name} @ {domain}")
+        return {"source": "hunter_io", "name": name, "domain": domain,
+                "email": d.get("email"), "confidence": d.get("score"),
+                "sources": d.get("sources", [])}
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════
+#  DOMAIN / IP SOURCES
+# ══════════════════════════════════════════════════════════════
+
+async def fetch_crtsh(domain: str, session: aiohttp.ClientSession) -> dict:
+    url = f"https://crt.sh/?q=%.{domain}&output=json"
+    data = await _get(session, url, label="crt.sh")
+    if data and isinstance(data, list):
+        subdomains = list({e["name_value"] for e in data})
+        logger.info(f"[crt.sh] {domain} → {len(subdomains)} subdomains")
+        return {"source": "crt.sh", "domain": domain, "subdomains": subdomains}
+    return {}
+
+
+async def fetch_rdap(domain: str, session: aiohttp.ClientSession) -> dict:
+    data = await _get(session, f"https://rdap.org/domain/{domain}", label="RDAP")
+    if data:
+        logger.info(f"[RDAP] {domain} → registrar fetched")
+        return {"source": "rdap", "domain": domain, "rdap": data}
+    return {}
+
+
+async def fetch_wayback(url_target: str, session: aiohttp.ClientSession, limit=30) -> dict:
+    cdx = (f"http://web.archive.org/cdx/search/cdx"
+           f"?url={url_target}&output=json&limit={limit}&fl=timestamp,original,statuscode")
+    data = await _get(session, cdx, label="Wayback")
+    if data and isinstance(data, list) and len(data) > 1:
+        return {"source": "wayback", "target": url_target, "snapshots": data[1:]}
+    return {}
+
+
+async def fetch_shodan(ip: str, session: aiohttp.ClientSession) -> dict:
+    if not SHODAN_API_KEY:
+        return {}
+    data = await _get(session, f"https://api.shodan.io/shodan/host/{ip}?key={SHODAN_API_KEY}", label="Shodan")
+    if data:
+        logger.info(f"[Shodan] {ip} → {len(data.get('ports',[]))} ports")
+        return {"source": "shodan", "ip": ip, "data": data}
+    return {}
+
+
+async def fetch_virustotal_domain(domain: str, session: aiohttp.ClientSession) -> dict:
+    if not VIRUSTOTAL_API_KEY:
+        return {}
+    data = await _get(session, f"https://www.virustotal.com/api/v3/domains/{domain}",
+                      headers={"x-apikey": VIRUSTOTAL_API_KEY}, label="VirusTotal")
+    if data:
+        return {"source": "virustotal", "domain": domain, "data": data}
+    return {}
+
+
+async def resolve_dns(domain: str) -> dict:
+    import asyncio
+    loop = asyncio.get_event_loop()
+    try:
+        infos = await loop.getaddrinfo(domain, None)
+        ips = list({i[4][0] for i in infos})
+        return {"source": "dns_resolver", "domain": domain, "ips": ips}
+    except Exception as e:
+        logger.warning(f"[DNS] {domain}: {e}")
+    return {}
+
+
+async def fetch_whois_json(domain: str, session: aiohttp.ClientSession) -> dict:
+    """Free WHOIS via whois.jsonwhois.io."""
+    data = await _get(session, f"https://jsonwhois.io/api/v1/whois?domain={domain}",
+                      headers={"Accept": "application/json"}, label="WHOIS")
+    if data:
+        return {"source": "whois", "domain": domain, "data": data}
+    return {}
+
+
+async def fetch_dnsdumpster(domain: str, session: aiohttp.ClientSession) -> dict:
+    """HackerTarget DNS lookup — free."""
+    data = await _get(session, f"https://api.hackertarget.com/dnslookup/?q={domain}", label="DNSDumpster")
+    if data and data.get("raw_text"):
+        return {"source": "dnsdumpster", "domain": domain, "records": data["raw_text"]}
+    return {}
+
+
+async def fetch_hackertarget_reverseip(ip: str, session: aiohttp.ClientSession) -> dict:
+    data = await _get(session, f"https://api.hackertarget.com/reverseiplookup/?q={ip}", label="HackerTarget")
+    if data and data.get("raw_text"):
+        return {"source": "hackertarget_reverseip", "ip": ip,
+                "domains": data["raw_text"].strip().splitlines()}
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════
+#  PHONE SOURCES
+# ══════════════════════════════════════════════════════════════
+
+async def fetch_numverify(phone: str, session: aiohttp.ClientSession) -> dict:
+    """Numverify free phone lookup (limited)."""
+    # Free endpoint without key for basic validation
+    try:
+        import phonenumbers
+        parsed = phonenumbers.parse(phone, None)
+        from phonenumbers import geocoder, carrier, timezone
+        return {
+            "source": "phonenumbers_lib",
+            "phone": phone,
+            "valid": phonenumbers.is_valid_number(parsed),
+            "country": geocoder.description_for_number(parsed, "en"),
+            "carrier": carrier.name_for_number(parsed, "en"),
+            "timezones": list(timezone.time_zones_for_number(parsed)),
+            "number_type": str(phonenumbers.number_type(parsed)),
+            "e164": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164),
+        }
+    except Exception as e:
+        logger.warning(f"[PhoneNumbers] {phone}: {e}")
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════
+#  FACE / IMAGE SOURCES
+# ══════════════════════════════════════════════════════════════
+
+async def search_face_tineye(image_url: str, session: aiohttp.ClientSession) -> dict:
+    """TinEye reverse image search."""
+    try:
+        url = f"https://tineye.com/search?url={image_url}"
+        async with session.get(url, headers=HEADERS_BROWSER, timeout=TIMEOUT) as r:
+            if r.status == 200:
+                text = await r.text()
+                # Parse result count from page
+                import re
+                match = re.search(r'(\d+)\s+results?', text, re.IGNORECASE)
+                count = int(match.group(1)) if match else 0
+                logger.info(f"[TinEye] {count} matches for image")
+                return {"source": "tineye", "image_url": image_url,
+                        "match_count": count, "search_url": url}
+    except Exception as e:
+        logger.warning(f"[TinEye] {e}")
+    return {}
+
+
+async def analyze_face_deepface(image_b64: str) -> dict:
+    """DeepFace analysis — age, gender, emotion, ethnicity."""
+    try:
+        import base64, tempfile, os
+        from deepface import DeepFace
+        img_bytes = base64.b64decode(image_b64)
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            f.write(img_bytes)
+            tmp = f.name
+        result = DeepFace.analyze(tmp, actions=["age", "gender", "emotion", "race"],
+                                  enforce_detection=False, silent=True)
+        os.unlink(tmp)
+        if isinstance(result, list):
+            result = result[0]
+        logger.info("[DeepFace] Analysis complete")
+        return {
+            "source": "deepface_analysis",
+            "age":        result.get("age"),
+            "gender":     result.get("dominant_gender"),
+            "emotion":    result.get("dominant_emotion"),
+            "ethnicity":  result.get("dominant_race"),
+            "gender_probs":   result.get("gender", {}),
+            "emotion_probs":  result.get("emotion", {}),
+            "race_probs":     result.get("race", {}),
+        }
+    except Exception as e:
+        logger.warning(f"[DeepFace] {e}")
+    return {}
+
+
+async def extract_face_embedding(image_b64: str) -> dict:
+    """Extract face embedding vector for similarity search."""
+    try:
+        import base64, tempfile, os
+        from deepface import DeepFace
+        img_bytes = base64.b64decode(image_b64)
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            f.write(img_bytes)
+            tmp = f.name
+        embedding = DeepFace.represent(tmp, model_name="ArcFace",
+                                       enforce_detection=False)
+        os.unlink(tmp)
+        if isinstance(embedding, list) and embedding:
+            vec = embedding[0].get("embedding", [])
+            logger.info(f"[FaceEmbed] Extracted {len(vec)}D ArcFace vector")
+            return {"source": "face_embedding", "model": "ArcFace",
+                    "dims": len(vec), "embedding": vec[:10]}  # store first 10 dims only
+    except Exception as e:
+        logger.warning(f"[FaceEmbed] {e}")
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════
+#  NEWS & MENTIONS
+# ══════════════════════════════════════════════════════════════
+
+async def fetch_newsapi(query: str, session: aiohttp.ClientSession) -> dict:
+    """NewsAPI.org free tier — 100 req/day."""
+    # AFTER — use the module-level constant
+    api_key = NEWSAPI_KEY
+    if not api_key:
+        # Fallback: use RSS feeds
+        return await fetch_news_rss(query, session)
+    params = {"q": query, "sortBy": "relevancy", "pageSize": 10,
+              "language": "en", "apiKey": api_key}
+    data = await _get(session, "https://newsapi.org/v2/everything", params=params, label="NewsAPI")
+    if data and data.get("articles"):
+        arts = data["articles"]
+        logger.info(f"[NewsAPI] {len(arts)} articles for: {query}")
+        return {
+            "source": "newsapi", "query": query,
+            "articles": [{"title": a.get("title"), "source": a.get("source", {}).get("name"),
+                           "url": a.get("url"), "published": a.get("publishedAt"),
+                           "description": a.get("description")} for a in arts],
+        }
+    return {}
+
+
+async def fetch_news_rss(query: str, session: aiohttp.ClientSession) -> dict:
+    """Google News RSS (no API key needed)."""
+    try:
+        url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en"
+        async with session.get(url, headers=HEADERS_BROWSER, timeout=TIMEOUT) as r:
+            if r.status == 200:
+                text = await r.text()
+                # Parse titles from RSS
+                import re
+                # AFTER
+                titles = re.findall(r'<title>(.*?)</title>', text)
+                links  = re.findall(r'<link>(https?://[^<]+)</link>', text)
+                dates  = re.findall(r'<pubDate>(.*?)</pubDate>', text)
+                articles = [{"title": t, "url": l, "published": d}
+                            for t, l, d in zip(titles[1:], links[1:], dates[:10])][:10]
+                if articles:
+                    logger.info(f"[NewsRSS] {len(articles)} articles for: {query}")
+                    return {"source": "google_news_rss", "query": query,
+                            "articles": articles}
+    except Exception as e:
+        logger.warning(f"[NewsRSS] {e}")
+    return {}
+
+
+
+async def fetch_gnews(query: str, session: aiohttp.ClientSession) -> dict:
+    """
+    GNews.io — 100 free articles/day, no credit card.
+    Register free at: gnews.io/register
+    Covers 60,000+ sources worldwide.
+    """
+    if GNEWS_API_KEY:
+        url = "https://gnews.io/api/v4/search"
+        params = {"q": query, "token": GNEWS_API_KEY, "lang": "en", "max": 10}
+        data = await _get(session, url, params=params, label="GNews")
+        if data and data.get("articles"):
+            arts = data["articles"]
+            logger.info(f"[GNews] {len(arts)} articles for: {query}")
+            return {
+                "source": "gnews", "query": query,
+                "articles": [{"title": a.get("title"), "url": a.get("url"),
+                              "source": a.get("source", {}).get("name"),
+                              "published": a.get("publishedAt"),
+                              "description": a.get("description"),
+                              "image": a.get("image")} for a in arts],
+            }
+
+    # Fallback: CurrentsAPI (600 free/day)
+    if CURRENTS_API_KEY:
+        url = "https://api.currentsapi.services/v1/search"
+        params = {"keywords": query, "apiKey": CURRENTS_API_KEY, "language": "en", "limit": 10}
+        data = await _get(session, url, params=params, label="CurrentsAPI")
+        if data and data.get("news"):
+            news = data["news"]
+            logger.info(f"[CurrentsAPI] {len(news)} articles for: {query}")
+            return {
+                "source": "currents_api", "query": query,
+                "articles": [{"title": n.get("title"), "url": n.get("url"),
+                              "source": n.get("author"),
+                              "published": n.get("published"),
+                              "description": n.get("description")} for n in news],
+            }
+
+    # Fallback: Google News RSS (always free, no key needed)
+    return await fetch_news_rss(query, session)
+
+
+async def fetch_news_multi(query: str, session: aiohttp.ClientSession) -> dict:
+    """
+    Try multiple news sources and merge results.
+    Priority: GNews → CurrentsAPI → Google News RSS
+    """
+    result = await fetch_gnews(query, session)
+    if result and result.get("articles"):
+        return result
+    newsapi = await fetch_newsapi(query, session)
+    if newsapi and newsapi.get("articles"):
+        return newsapi
+    # Also try Google News RSS as supplement
+    rss = await fetch_news_rss(query, session)
+    if rss and rss.get("articles"):
+        return rss
+
+    return {}
+
+async def fetch_pastebin_search(query: str, session: aiohttp.ClientSession) -> dict:
+    """Pastebin search disabled - psbdmp.ws unreliable."""
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════
+#  ORCHESTRATORS (call from engine.py)
+# ══════════════════════════════════════════════════════════════
+
+
+
+def derive_usernames(name: str) -> list:
+    """
+    Auto-generate likely username candidates from a full name.
+    e.g. "Sundar Pichai" → ["sundarpichai", "sundar.pichai", "spichai", ...]
+    """
+    parts = name.lower().strip().split()
+    if not parts:
+        return []
+    candidates = []
+    if len(parts) >= 2:
+        first, last = parts[0], parts[-1]
+        candidates += [
+            f"{first}{last}",           # sundarpichai
+            f"{first}.{last}",          # sundar.pichai
+            f"{first}_{last}",          # sundar_pichai
+            f"{first[0]}{last}",        # spichai
+            f"{first}{last[0]}",        # sundarp
+            f"{first}-{last}",          # sundar-pichai
+            f"{last}{first}",           # pichaisundar
+            f"{first}",                 # sundar
+            f"{last}",                  # pichai
+        ]
+    else:
+        candidates.append(parts[0])
+    # Remove duplicates while preserving order
+    seen = set()
+    return [c for c in candidates if not (c in seen or seen.add(c))]
+
+
+async def fetch_profile_image(url: str, session: aiohttp.ClientSession) -> str:
+    """Download an image URL and return base64 string."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), ssl=False) as r:
+            if r.status == 200:
+                ct = r.headers.get("Content-Type", "")
+                if "image" in ct or url.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+                    data = await r.read()
+                    import base64
+                    return base64.b64encode(data).decode()
+    except Exception:
+        pass
+    return ""
+
+
+async def fetch_wikipedia_with_image(name: str, session: aiohttp.ClientSession) -> dict:
+    """Wikipedia summary + full image fetch."""
+    # Try exact name first, then title-cased
+    for query in [name, name.title(), name.replace(" ", "_")]:
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ', '_')}"
+        data = await _get(session, url, label="Wikipedia")
+        if data and data.get("extract") and "not found" not in data.get("type", ""):
+            result = {
+                "source": "wikipedia", "name": name,
+                "title":       data.get("title"),
+                "extract":     data.get("extract"),
+                "description": data.get("description"),
+                "url":         data.get("content_urls", {}).get("desktop", {}).get("page"),
+                "thumbnail":   data.get("thumbnail", {}).get("source"),
+                "image_b64":   "",
+                "wikidata_id": data.get("wikibase_item"),
+            }
+            # Fetch actual image
+            if result["thumbnail"]:
+                # Get full-size image URL
+                full_img = result["thumbnail"].replace("/thumb/", "/").rsplit("/", 1)[0]
+                result["image_b64"] = await fetch_profile_image(result["thumbnail"], session)
+            logger.info(f"[Wikipedia] Found article for: {name}")
+            return result
+    return {}
+
+
+async def fetch_github_user_enhanced(username: str, session: aiohttp.ClientSession) -> dict:
+    """GitHub full profile with avatar image."""
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    try:
+        async with session.get(f"https://api.github.com/users/{username}",
+                               headers=headers, timeout=TIMEOUT) as r:
+            if r.status != 200:
+                return {}
+            profile = await r.json()
+
+        repos, orgs = await asyncio.gather(
+            _get(session, f"https://api.github.com/users/{username}/repos?per_page=10&sort=updated", headers=headers, label="GH repos"),
+            _get(session, f"https://api.github.com/users/{username}/orgs", headers=headers, label="GH orgs"),
+        )
+
+        # Fetch avatar
+        avatar_b64 = ""
+        if profile.get("avatar_url"):
+            avatar_b64 = await fetch_profile_image(profile["avatar_url"], session)
+
+        logger.info(f"[GitHub] {username} → {len(repos or [])} repos, {len(orgs or [])} orgs")
+        return {
+            "source": "github", "username": username,
+            "name":         profile.get("name"),
+            "bio":          profile.get("bio"),
+            "location":     profile.get("location"),
+            "company":      profile.get("company"),
+            "blog":         profile.get("blog"),
+            "email":        profile.get("email"),
+            "followers":    profile.get("followers"),
+            "following":    profile.get("following"),
+            "public_repos": profile.get("public_repos"),
+            "created_at":   profile.get("created_at"),
+            "avatar_url":   profile.get("avatar_url"),
+            "avatar_b64":   avatar_b64,
+            "profile_url":  profile.get("html_url"),
+            "repos":        [{"name": r.get("name"), "language": r.get("language"),
+                              "stars": r.get("stargazers_count"), "description": r.get("description")}
+                             for r in (repos or [])[:10]],
+            "orgs":         [o.get("login") for o in (orgs or [])],
+        }
+    except Exception as e:
+        logger.warning(f"[GitHub] {username}: {e}")
+    return {}
+
+
+async def fetch_reddit_user_enhanced(username: str, session: aiohttp.ClientSession) -> dict:
+    """Reddit profile with avatar."""
+    try:
+        h = {"User-Agent": "PRAHAR-OSINT/2.0"}
+        about = await _get(session, f"https://www.reddit.com/user/{username}/about.json", headers=h, label="Reddit")
+        if not about or not about.get("data"):
+            return {}
+        d = about["data"]
+
+        # Fetch avatar
+        avatar_b64 = ""
+        icon = d.get("icon_img", "").split("?")[0]  # strip query params
+        if icon and icon.startswith("http"):
+            avatar_b64 = await fetch_profile_image(icon, session)
+
+        posts = await _get(session, f"https://www.reddit.com/user/{username}/submitted.json?limit=10", headers=h, label="Reddit posts")
+        logger.info(f"[Reddit] {username} → {d.get('link_karma',0)} karma")
+        return {
+            "source": "reddit", "username": username,
+            "name":          d.get("name"),
+            "created_utc":   d.get("created_utc"),
+            "link_karma":    d.get("link_karma"),
+            "comment_karma": d.get("comment_karma"),
+            "is_verified":   d.get("verified"),
+            "icon_img":      icon,
+            "avatar_b64":    avatar_b64,
+            "profile_url":   f"https://reddit.com/u/{username}",
+            "posts": [
+                {"title": p["data"].get("title"), "subreddit": p["data"].get("subreddit"),
+                 "score": p["data"].get("score"), "url": p["data"].get("url"),
+                 "created": p["data"].get("created_utc")}
+                for p in (posts or {}).get("data", {}).get("children", [])[:5]
+                if p.get("data")
+            ],
+        }
+    except Exception as e:
+        logger.warning(f"[Reddit] {username}: {e}")
+    return {}
+
+
+async def fetch_wikidata_structured(name: str, session: aiohttp.ClientSession) -> dict:
+    """Wikidata structured entity — birth, nationality, occupation, image."""
+    url = "https://www.wikidata.org/w/api.php"
+    params = {"action": "wbsearchentities", "search": name, "language": "en",
+              "format": "json", "type": "item", "limit": 1}
+    data = await _get(session, url, params=params, label="Wikidata search")
+    if not data or not data.get("search"):
+        return {}
+
+    entity_id = data["search"][0].get("id")
+    if not entity_id:
+        return {}
+
+    # Get entity details
+    params2 = {"action": "wbgetentities", "ids": entity_id, "format": "json",
+               "languages": "en", "props": "labels|descriptions|claims|sitelinks"}
+    entity_data = await _get(session, url, params=params2, label="Wikidata entity")
+    if not entity_data:
+        return {}
+
+    entity = entity_data.get("entities", {}).get(entity_id, {})
+    claims = entity.get("claims", {})
+
+    def get_claim(prop):
+        vals = claims.get(prop, [])
+        if vals:
+            snak = vals[0].get("mainsnak", {})
+            dv = snak.get("datavalue", {})
+            v = dv.get("value")
+            if isinstance(v, dict):
+                return v.get("time") or v.get("text") or v.get("id")
+            return v
+        return None
+
+    # P18=image, P569=birth, P27=country, P106=occupation, P856=website
+    image_name = get_claim("P18")
+    image_b64 = ""
+    image_url = ""
+    if image_name and isinstance(image_name, str):
+        img_clean = image_name.replace(" ", "_")
+        image_url = f"https://commons.wikimedia.org/wiki/Special:FilePath/{img_clean}?width=300"
+        image_b64 = await fetch_profile_image(image_url, session)
+
+    logger.info(f"[Wikidata] Structured data for: {name} ({entity_id})")
+    return {
+        "source": "wikidata", "name": name,
+        "entity_id":   entity_id,
+        "description": entity.get("descriptions", {}).get("en", {}).get("value"),
+        "birth_date":  get_claim("P569"),
+        "nationality": get_claim("P27"),
+        "occupation":  get_claim("P106"),
+        "website":     get_claim("P856"),
+        "twitter":     get_claim("P2002"),
+        "linkedin":    get_claim("P6634"),
+        "github":      get_claim("P2037"),
+        "image_url":   image_url,
+        "image_b64":   image_b64,
+        "wikidata_url": f"https://www.wikidata.org/wiki/{entity_id}",
+    }
+
+
+async def fetch_archive_presence(name: str, session: aiohttp.ClientSession) -> dict:
+    """Check Wayback Machine for archived presence."""
+    query = name.replace(" ", "+")
+    cdx = f"http://web.archive.org/cdx/search/cdx?url=*{query}*&output=json&limit=10&fl=timestamp,original"
+    data = await _get(session, cdx, label="Archive.org")
+    if data and isinstance(data, list) and len(data) > 1:
+        snapshots = [{"timestamp": r[0], "url": r[1]} for r in data[1:]]
+        logger.info(f"[Archive] {len(snapshots)} archived pages for: {name}")
+        return {"source": "archive_org", "name": name, "snapshots": snapshots}
+    return {}
+
+
+
+async def _fetch_image_b64(url: str, session: aiohttp.ClientSession) -> str:
+    """Download image URL and return base64 string. Returns empty string on failure."""
+    if not url or not url.startswith("http"):
+        return ""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), ssl=False) as r:
+            if r.status == 200 and "image" in r.headers.get("Content-Type", ""):
+                return base64.b64encode(await r.read()).decode()
+    except Exception:
+        pass
+    return ""
+
+
+async def _img(url, session):
+    """Download image, return base64 string."""
+    if not url or not url.startswith("http"): return ""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), ssl=False) as r:
+            if r.status == 200 and "image" in r.headers.get("Content-Type",""):
+                return base64.b64encode(await r.read()).decode()
+    except Exception: pass
+    return ""
+
+
+def _derive_usernames(name: str) -> list:
+    """Generate username candidates from any full name."""
+    parts = name.lower().strip().split()
+    candidates = []
+    if len(parts) >= 2:
+        f, l = parts[0], parts[-1]
+        candidates += [
+            f"{f}{l}",       # johnsmith
+            f"{f}.{l}",      # john.smith
+            f"{f}_{l}",      # john_smith
+            f"{f[0]}{l}",    # jsmith
+            f"{f}{l[0]}",    # johns
+            f"{l}{f}",       # smithjohn
+            f"{l}{f[0]}",    # smithj
+            f"{f}",          # john
+            f"{l}",          # smith
+        ]
+        # Handle middle names
+        if len(parts) >= 3:
+            m = parts[1]
+            candidates += [f"{f}{m[0]}{l}", f"{f[0]}{m[0]}{l}"]
+    elif parts:
+        candidates.append(parts[0])
+    seen = set()
+    return [x for x in candidates if x and not (x in seen or seen.add(x))]
+
+
+async def run_person_osint(name: str, username: str = "", email: str = "",
+                            phone: str = "", image_b64: str = "",
+                            session: aiohttp.ClientSession = None) -> list:
+    """
+    Universal OSINT sweep — works for ANY person.
+    Famous CEO, local politician, academic, business owner, anyone.
+    
+    Strategy:
+    1. Google CSE (primary) — searches the entire web
+    2. Wikipedia/Wikidata — for notable individuals
+    3. GitHub/Reddit/HN/Keybase — for tech/developer profiles
+    4. Academic sources — Google Scholar, ResearchGate
+    5. Professional — LinkedIn (via CSE), company sites
+    6. Social — multiple platform username sweep
+    7. News — recent mentions anywhere on the internet
+    """
+
+    # ── Clean name & derive usernames ─────────────────────────
+    clean = re.sub(r"^(Dr|Mr|Mrs|Ms|Prof|Eng|Capt|Col|Gen|Rev|Sir|IAS|IPS|IFS)\.?\s+", 
+                   "", name.strip(), flags=re.IGNORECASE).strip()
+    
+    # Build username candidates
+    if username and username.strip().lower() != name.strip().lower():
+        usernames = [username.strip()] + _derive_usernames(clean)
+    else:
+        usernames = _derive_usernames(clean)
+    
+    primary_u = usernames[0] if usernames else ""
+    global GOOGLE_CSE_KEY, GOOGLE_CSE_ID, GITHUB_TOKEN
+    GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY","")
+    GOOGLE_CSE_ID  = os.getenv("GOOGLE_CSE_ID","")
+    GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN","")
+    logger.info(f"[OSINT] Universal sweep: '{name}' | clean='{clean}' | usernames={usernames[:3]}")
+
+    results = []
+    images = []
+
+    def add(label, data):
+        if data and isinstance(data, dict): results.append((label, data))
+
+    def collect_img(label, data):
+        if not data: return
+        for k in ("avatar_b64","image_b64"):
+            if data.get(k): images.append({"source":label,"b64":data[k],"url":data.get("avatar_url","")})
+
+    # ════════════════════════════════════════════════════════
+    # BATCH 1: Google CSE — PRIMARY for ALL persons
+    # ════════════════════════════════════════════════════════
+    if GOOGLE_CSE_KEY and GOOGLE_CSE_ID:
+        logger.info(f"[OSINT] CSE sweep for: '{clean}'")
+
+        async def cse(q, lbl, num=8):
+            try:
+                url = "https://www.googleapis.com/customsearch/v1"
+                params = {"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_ID, "q": q, "num": num}
+                data = await _get(session, url, params=params, label=f"CSE[{lbl}]")
+                if data and data.get("items"):
+                    items = data["items"]
+                    logger.info(f"[CSE:{lbl}] {len(items)} results")
+                    return {
+                        "source": f"google_{lbl}", "query": q,
+                        "total": data.get("searchInformation",{}).get("totalResults","?"),
+                        "results": [{
+                            "title": i.get("title"), "url": i.get("link"),
+                            "snippet": i.get("snippet"),
+                            "og_desc": (i.get("pagemap",{}).get("metatags",[{}])[0]).get("og:description",""),
+                        } for i in items]
+                    }
+            except Exception as e:
+                logger.debug(f"[CSE:{lbl}] {e}")
+            return {}
+
+        # Fire all CSE searches concurrently
+        cse_results = await asyncio.gather(
+            cse(f'"{clean}"',                           "web"),
+            cse(f'site:linkedin.com "{clean}"',         "linkedin"),
+            cse(f'"{clean}" news',                      "news"),
+            cse(f'"{clean}" biography OR profile',      "bio"),
+            cse(f'site:twitter.com "{clean}"',          "twitter"),
+            cse(f'"{clean}" company OR organization',   "company"),
+            cse(f'"{clean}" site:facebook.com',         "facebook"),
+            cse(f'site:scholar.google.com "{clean}"',   "scholar"),
+            cse(f'"{clean}" site:researchgate.net',     "research"),
+            cse(f'"{clean}" site:youtube.com',          "youtube"),
+            cse(f'"{clean}" site:instagram.com',        "instagram"),
+            cse(f'"{clean}" phone OR email OR contact', "contact"),
+            return_exceptions=True
+        )
+        cse_labels = ["web","linkedin","news","bio","twitter","company","facebook","scholar","research","youtube","instagram","contact"]
+        for lbl, res in zip(cse_labels, cse_results):
+            if isinstance(res, Exception): logger.debug(f"[CSE:{lbl}] {res}")
+            elif res: add(f"google_{lbl}", res)
+
+        await asyncio.sleep(0.1)
+    else:
+        logger.warning("[OSINT] GOOGLE_CSE_KEY or GOOGLE_CSE_ID not set — skipping all 12 CSE searches. "
+                   "Set both in .env to enable primary OSINT engine.")
+    # ════════════════════════════════════════════════════════
+    # BATCH 2: Wikipedia + Wikidata (works for notable people)
+    # ════════════════════════════════════════════════════════
+    async def wiki():
+        parts_w = clean.split()
+        variants = [clean, name]
+        if len(parts_w) >= 2:
+            variants += [
+                " ".join(p for p in parts_w if not re.match(r'^[A-Z][\.]*$',p)),
+                parts_w[-1], parts_w[0],
+            ]
+        # Also try with T. R. / T.R. style
+        if len(parts_w) == 1:
+            for pfx in ["T. R.","T.R.","P.","M.","K.","R.","S.","A."]:
+                variants.append(f"{pfx} {clean}")
+        variants = list(dict.fromkeys(v for v in variants if v.strip()))
+        
+        for var in variants:
+            try:
+                url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{var.replace(' ','_')}"
+                d = await _get(session, url, label="Wikipedia")
+                if d and d.get("extract") and "disambiguation" not in d.get("type","") and d.get("type")!="https://mediawiki.org/wiki/HyperSwitch/errors/not_found" and not (d.get("description","") in ("family name","surname","given name","human name") or d.get("title","").lower() in ["ghosh","sharma","kumar","singh","patel"]):
+                    res = {"source":"wikipedia","name":name,"title":d.get("title"),
+                           "extract":d.get("extract"),"description":d.get("description"),
+                           "url":d.get("content_urls",{}).get("desktop",{}).get("page"),
+                           "thumbnail":d.get("thumbnail",{}).get("source"),
+                           "wikidata_id":d.get("wikibase_item"),"image_b64":""}
+                    if res["thumbnail"]: res["image_b64"] = await _img(res["thumbnail"], session)
+                    logger.info(f"[Wikipedia] Found: {res['title']}")
+                    return res
+            except Exception as e: logger.debug(f"[Wiki] {var}: {e}")
+        
+        # Search API fallback
+        try:
+            d = await _get(session,"https://en.wikipedia.org/w/api.php",
+                          params={"action":"query","list":"search","srsearch":clean,
+                                  "format":"json","srlimit":3}, label="Wikipedia Search")
+            if d and d.get("query",{}).get("search"):
+                title = d["query"]["search"][0].get("title","")
+                art = await _get(session, f"https://en.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ','_')}", label="Wikipedia Article")
+                if art and art.get("extract") and art.get("description","") not in ("family name","surname","given name","film","film awards","award ceremony"):
+                    res = {"source":"wikipedia","name":name,"title":art.get("title"),
+                           "extract":art.get("extract"),"description":art.get("description"),
+                           "url":art.get("content_urls",{}).get("desktop",{}).get("page"),
+                           "thumbnail":art.get("thumbnail",{}).get("source"),"image_b64":""}
+                    if res["thumbnail"]: res["image_b64"] = await _img(res["thumbnail"], session)
+                    logger.info(f"[Wikipedia Search] Found: {res['title']}")
+                    return res
+        except Exception as e: logger.debug(f"[Wiki Search] {e}")
+        return {}
+
+    async def wikidata():
+        url = "https://www.wikidata.org/w/api.php"
+        parts_wd = clean.split()
+        variants_wd = [clean, name]
+        if len(parts_wd) >= 2:
+            no_init = " ".join(p for p in parts_wd if len(p)>2 and "." not in p)
+            if no_init: variants_wd.append(no_init)
+            variants_wd.append(parts_wd[-1])
+        for q in variants_wd:
+            try:
+                s = await _get(session, url, params={"action":"wbsearchentities","search":q,
+                               "language":"en","format":"json","type":"item","limit":1}, label="Wikidata")
+                if not s or not s.get("search"): continue
+                eid = s["search"][0].get("id")
+                if not eid: continue
+                ed = await _get(session, url, params={"action":"wbgetentities","ids":eid,
+                                "format":"json","languages":"en",
+                                "props":"labels|descriptions|claims|sitelinks"}, label="Wikidata entity")
+                if not ed: continue
+                entity = ed.get("entities",{}).get(eid,{})
+                claims = entity.get("claims",{})
+                def gc(prop):
+                    vals = claims.get(prop,[])
+                    if not vals: return None
+                    dv = vals[0].get("mainsnak",{}).get("datavalue",{}).get("value")
+                    if isinstance(dv,dict): return dv.get("time") or dv.get("text") or dv.get("id")
+                    return dv
+                img_name = gc("P18")
+                img_b64 = ""
+                img_url = ""
+                if img_name and isinstance(img_name,str):
+                    img_url = f"https://commons.wikimedia.org/wiki/Special:FilePath/{img_name.replace(' ','_')}?width=400"
+                    img_b64 = await _img(img_url, session)
+                logger.info(f"[Wikidata] Found: {eid} for '{q}'")
+                return {"source":"wikidata","name":name,"entity_id":eid,
+                        "description":entity.get("descriptions",{}).get("en",{}).get("value"),
+                        "birth_date":gc("P569"),"nationality":gc("P27"),"occupation":gc("P106"),
+                        "employer":gc("P108"),"website":gc("P856"),"twitter":gc("P2002"),
+                        "linkedin":gc("P6634"),"github":gc("P2037"),"image_url":img_url,"image_b64":img_b64,
+                        "wikidata_url":f"https://www.wikidata.org/wiki/{eid}"}
+            except Exception as e: logger.debug(f"[Wikidata] {q}: {e}")
+        return {}
+
+    async def news_search():
+        return await fetch_news_multi(clean, session)
+
+    async def archive():
+        try:
+            q = clean.replace(" ","+")
+            d = await _get(session,f"http://web.archive.org/cdx/search/cdx?url=*{q}*&output=json&limit=5&fl=timestamp,original",label="Archive")
+            if d and isinstance(d,list) and len(d)>1:
+                return {"source":"archive_org","name":name,"snapshots":[{"timestamp":r[0],"url":r[1]} for r in d[1:]]}
+        except Exception: pass
+        return {}
+
+    # Run batch 2 concurrently
+    b2 = await asyncio.gather(wiki(), wikidata(), news_search(), archive(), return_exceptions=True)
+    for lbl, res in zip(["wikipedia","wikidata","news","archive"], b2):
+        if isinstance(res, Exception): logger.debug(f"[OSINT] {lbl}: {res}")
+        elif res: add(lbl, res); collect_img(lbl, res)
+
+    # ════════════════════════════════════════════════════════
+    # BATCH 3: Username-based platforms (try multiple candidates)
+    # ════════════════════════════════════════════════════════
+    if usernames:
+        async def github_u(u):
+            headers = {"Accept":"application/vnd.github+json"}
+            if GITHUB_TOKEN: headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+            try:
+                async with session.get(f"https://api.github.com/users/{u}", headers=headers, timeout=TIMEOUT) as r:
+                    if r.status != 200: return {}
+                    p = await r.json()
+                repos = await _get(session,f"https://api.github.com/users/{u}/repos?per_page=10&sort=updated",headers=headers,label="GH") or []
+                orgs  = await _get(session,f"https://api.github.com/users/{u}/orgs",headers=headers,label="GHorgs") or []
+                av = await _img(p.get("avatar_url",""), session)
+                logger.info(f"[GitHub] {u} → {len(repos)} repos, {p.get('followers',0)} followers")
+                return {"source":"github","username":u,"name":p.get("name"),"bio":p.get("bio"),
+                        "location":p.get("location"),"company":p.get("company"),"blog":p.get("blog"),
+                        "email":p.get("email"),"followers":p.get("followers"),"public_repos":p.get("public_repos"),
+                        "created_at":p.get("created_at"),"avatar_url":p.get("avatar_url"),"avatar_b64":av,
+                        "profile_url":p.get("html_url"),
+                        "repos":[{"name":r.get("name"),"language":r.get("language"),"stars":r.get("stargazers_count")} for r in repos[:8]],
+                        "orgs":[o.get("login") for o in orgs]}
+            except Exception as e: logger.debug(f"[GitHub] {u}: {e}")
+            return {}
+
+        async def reddit_u(u):
+            try:
+                h = {"User-Agent":"PRAHAR-OSINT/2.0"}
+                about = await _get(session,f"https://www.reddit.com/user/{u}/about.json",headers=h,label="Reddit")
+                if not about or not about.get("data"): return {}
+                d = about["data"]
+                icon = (d.get("icon_img") or "").split("?")[0]
+                av = await _img(icon, session) if icon.startswith("http") else ""
+                posts_r = await _get(session,f"https://www.reddit.com/user/{u}/submitted.json?limit=5",headers=h,label="Reddit posts")
+                posts = [{"title":p["data"].get("title"),"subreddit":p["data"].get("subreddit"),"score":p["data"].get("score")}
+                         for p in (posts_r or {}).get("data",{}).get("children",[])[:5] if p.get("data")]
+                logger.info(f"[Reddit] {u} → {d.get('link_karma',0)} karma")
+                return {"source":"reddit","username":u,"link_karma":d.get("link_karma"),
+                        "comment_karma":d.get("comment_karma"),"created_utc":d.get("created_utc"),
+                        "avatar_b64":av,"profile_url":f"https://reddit.com/u/{u}","posts":posts}
+            except Exception as e: logger.debug(f"[Reddit] {u}: {e}")
+            return {}
+
+        # Try primary username first, then alternatives
+        gh_tasks = [github_u(u) for u in usernames[:3]]
+        gh_results = await asyncio.gather(*gh_tasks, return_exceptions=True)
+        for u, res in zip(usernames[:3], gh_results):
+            if not isinstance(res, Exception) and res and res.get("followers") is not None:
+                add("github", res); collect_img("github", res); break
+
+        # Reddit, HN, Keybase, GitLab for primary
+        b3 = await asyncio.gather(
+            reddit_u(primary_u),
+            fetch_hackernews_user(primary_u, session),
+            fetch_keybase(primary_u, session),
+            fetch_gitlab_user(primary_u, session),
+            fetch_username_sweep(primary_u, session),
+            return_exceptions=True
+        )
+        for lbl, res in zip(["reddit","hackernews","keybase","gitlab","username_sweep"], b3):
+            if not isinstance(res, Exception) and res:
+                add(lbl, res); collect_img(lbl, res)
+
+    # ════════════════════════════════════════════════════════
+    # BATCH 4: Academic & Professional sources
+    # ════════════════════════════════════════════════════════
+    async def academic_search():
+        """Search academic profiles via free APIs."""
+        results_a = {}
+        # OpenAlex - free academic graph
+        try:
+            url = "https://api.openalex.org/authors"
+            params = {"search": clean, "per-page": 3}
+            d = await _get(session, url, params=params, label="OpenAlex")
+            if d and d.get("results"):
+                authors = d["results"]
+                best = authors[0]
+                logger.info(f"[OpenAlex] Found academic: {best.get('display_name')}")
+                results_a["openalex"] = {
+                    "source": "openalex", "name": name,
+                    "display_name": best.get("display_name"),
+                    "orcid": best.get("orcid"),
+                    "works_count": best.get("works_count"),
+                    "cited_by_count": best.get("cited_by_count"),
+                    "affiliations": [a.get("institution",{}).get("display_name") for a in best.get("affiliations",[])[:3]],
+                    "topics": [t.get("display_name") for t in best.get("topics",[])[:5]],
+                    "profile_url": best.get("id"),
+                }
+        except Exception as e: logger.debug(f"[OpenAlex] {e}")
+
+        # Crossref - publications
+        try:
+            url = f"https://api.crossref.org/works?query.author={clean.replace(' ','+')}&rows=3"
+            d = await _get(session, url, label="Crossref")
+            if d and d.get("message",{}).get("items"):
+                items = d["message"]["items"]
+                results_a["publications"] = {
+                    "source": "crossref", "name": name,
+                    "works": [{"title": i.get("title",[""])[0], "year": i.get("published",{}).get("date-parts",[[None]])[0][0],
+                               "doi": i.get("DOI"), "journal": (i.get("container-title") or [""])[0]}
+                              for i in items[:3]]
+                }
+                logger.info(f"[Crossref] {len(items)} publications for {name}")
+        except Exception as e: logger.debug(f"[Crossref] {e}")
+
+        return results_a
+
+    acad = await academic_search()
+    for k, v in acad.items():
+        add(k, v)
+
+    # ════════════════════════════════════════════════════════
+    # BATCH 5: Email + Phone + Face
+    # ════════════════════════════════════════════════════════
+    misc_tasks, misc_labels = [], []
+    if email:
+        misc_tasks += [fetch_breach_free(email, session), fetch_gravatar(email, session)]
+        misc_labels += ["emailrep", "gravatar"]
+    if phone:
+        misc_tasks.append(fetch_numverify(phone, session))
+        misc_labels.append("phone")
+    if image_b64:
+        misc_tasks += [analyze_face_deepface(image_b64), extract_face_embedding(image_b64)]
+        misc_labels += ["deepface", "face_embed"]
+
+    if misc_tasks:
+        misc_res = await asyncio.gather(*misc_tasks, return_exceptions=True)
+        for lbl, res in zip(misc_labels, misc_res):
+            if not isinstance(res, Exception) and res:
+                add(lbl, res)
+
+    # ════════════════════════════════════════════════════════
+    # Assemble image gallery
+    # ════════════════════════════════════════════════════════
+    if images:
+        add("image_gallery", {"source":"image_gallery","name":name,"images":images,"count":len(images)})
+        logger.info(f"[OSINT] {len(images)} images collected for '{name}'")
+
+    logger.info(f"[OSINT] COMPLETE: '{name}' → {len(results)} sources | CSE={'YES' if GOOGLE_CSE_KEY else 'NO'}")
+    return results
+
