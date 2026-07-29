@@ -5,6 +5,8 @@ PRAHAR is an evidence-driven intelligence platform for transforming fragmented p
 The project is intentionally modular: each stage of the workflow is isolated as a capability, allowing the system to evolve from a research prototype into a production-grade decision-support platform.
 
 ---
+<img width="1536" height="1024" alt="Overall Architecture" src="https://github.com/user-attachments/assets/57028f9c-fc57-443f-b42b-a50dfad5b017" />
+
 
 ## Why this project exists
 
@@ -81,6 +83,8 @@ The system is designed around asynchronous processing, modular services, and a s
 - Graph-based modeling of evidence relationships and contradictions.
 - NLP-based entity extraction and normalization.
 - Structured storage for entities, aliases, and evidence relationships.
+
+<img width="1536" height="1024" alt="Provenance model" src="https://github.com/user-attachments/assets/5d8227b9-d88b-4842-bb2f-27709dbc0ab7" />
 
 ### Confidence scoring
 - Multi-layer adaptive scoring using AMCE.
@@ -246,6 +250,7 @@ The repository includes a containerized deployment model that provisions the cor
 This is the recommended path for local development and controlled evaluation environments.
 
 ---
+<img width="1536" height="1024" alt="Deployement Architecutre" src="https://github.com/user-attachments/assets/b3cadd9c-a84e-48da-bc59-c81a0bcb91cf" />
 
 ## API overview
 
@@ -280,6 +285,8 @@ A typical investigation flow looks like this:
 This workflow emphasizes repeatability, observability, and evidence linkage rather than ad hoc analysis.
 
 ---
+
+<img width="1536" height="1024" alt="Agent Lifecycle" src="https://github.com/user-attachments/assets/b0679a1e-df8a-41e3-b45a-c972076e66cc" />
 
 ## Security model
 
